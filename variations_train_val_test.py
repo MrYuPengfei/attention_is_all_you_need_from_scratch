@@ -5,6 +5,7 @@
     python variations_train_val_test.py --variant A1 --epochs 3
 
 每个 epoch 开始时会打印训练/验证/测试集的首个句子；
+训练过程中默认每 100 个 optimizer step 写一条日志；
 每个 epoch 结束时计算 PPL/BLEU，并在 PPL 变好时立即保存最优模型。
 
 快速冒烟测试示例：
@@ -13,8 +14,9 @@
         --epochs 2 --train-steps 1000 --batch-size 2 --accum-steps 1 \
         --max-val-samples 20 --max-test-samples 20 --max-len 32
 
-结果保存目录：results/variations/
-最优模型：results/variations/checkpoints/<variant>_best.pt
+结果保存目录：results/<variant>/
+最优模型：results/<variant>/checkpoints/<variant>_best.pt
+日志目录：results/<variant>/logs/
 """
 
 import argparse
@@ -22,6 +24,7 @@ import csv
 import math
 import os
 import random
+import sys
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -35,7 +38,7 @@ from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = ROOT / "dataset" / "wmt14" / "de-en"
-DEFAULT_RESULTS_DIR = ROOT / "results" / "variations"
+DEFAULT_RESULTS_DIR = ROOT / "results"
 
 PAD, BOS, EOS, UNK = 0, 1, 2, 3
 
@@ -385,7 +388,7 @@ def evaluate_ppl(model, loader, criterion, device):
         label_smoothing=criterion.label_smoothing,
         reduction="sum",
     )
-    for src, tgt_in, tgt_out in tqdm(loader, desc="eval ppl", leave=False, dynamic_ncols=True):
+    for src, tgt_in, tgt_out in tqdm(loader, desc="eval ppl", leave=False, dynamic_ncols=True, disable=not sys.stderr.isatty()):
         src, tgt_in, tgt_out = src.to(device), tgt_in.to(device), tgt_out.to(device)
         logits = model(src, tgt_in)
         total_loss += eval_criterion(logits.view(-1, logits.size(-1)), tgt_out.view(-1)).item()
@@ -437,7 +440,7 @@ def evaluate_bleu(model, loader, sp, args, device):
     """计算测试集 BLEU，并带进度条。"""
     model.eval()
     hypotheses, references = [], []
-    for src, tgt_in, _ in tqdm(loader, desc="eval bleu", leave=False, dynamic_ncols=True):
+    for src, tgt_in, _ in tqdm(loader, desc="eval bleu", leave=False, dynamic_ncols=True, disable=not sys.stderr.isatty()):
         for i in range(src.size(0)):
             hypothesis = beam_search(
                 model, src[i], sp, args.max_len, args.beam_size,
@@ -468,8 +471,16 @@ def train_and_evaluate(
             break
 
         epoch_started = time.perf_counter()
+
+        # batch 总数按 DataLoader 长度计算；若目标步数不足一轮，则按剩余步数截断。
+        dataset_batches = len(train_loader)
+        batches_this_epoch = min(dataset_batches, (target_steps - step) * args.accum_steps)
+        # 只有攒满 accum_steps 个 batch 才会更新一次参数，因此这里用 floor。
+        steps_this_epoch = batches_this_epoch // args.accum_steps
         log(
-            f"epoch {epoch}/{args.epochs} 开始 | global_step={step}/{target_steps}",
+            f"epoch {epoch}/{args.epochs} 开始 | global_step={step}/{target_steps} | "
+            f"dataset_batches={dataset_batches} batches_this_epoch={batches_this_epoch} "
+            f"optimizer_steps={steps_this_epoch} accum_steps={args.accum_steps}",
             args.variant,
         )
 
@@ -479,17 +490,17 @@ def train_and_evaluate(
         peek_first_test(args.variant, sp, model, test_loader, args, device)
         model.train()
 
-        steps_this_epoch = min(
-            target_steps - step,
-            math.ceil(len(train_loader) / args.accum_steps),
-        )
         progress = tqdm(
             total=steps_this_epoch,
             desc=f"epoch {epoch}/{args.epochs}",
             unit="step",
             dynamic_ncols=True,
+            disable=not sys.stderr.isatty(),
         )
         accum, printed_train = 0, False
+        batch_in_epoch = 0
+        epoch_step = 0
+        next_progress_pct = args.log_progress_percent
         optimizer.zero_grad(set_to_none=True)
 
         for src, tgt_in, tgt_out in train_loader:
@@ -502,6 +513,7 @@ def train_and_evaluate(
             loss = criterion(logits.view(-1, logits.size(-1)), tgt_out.view(-1))
             (loss / args.accum_steps).backward()
             accum += 1
+            batch_in_epoch += 1
 
             if accum == args.accum_steps:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -509,26 +521,56 @@ def train_and_evaluate(
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 accum, step = 0, step + 1
+                epoch_step += 1
                 progress.update(1)
                 progress.set_postfix(
+                    batch=f"{batch_in_epoch}/{batches_this_epoch}",
                     loss=f"{loss.item():.4f}",
                     lr=f"{scheduler.get_last_lr()[0]:.2e}",
                     time=datetime.now().strftime("%H:%M:%S"),
                 )
 
-                if step % args.log_interval == 0 or step == 1:
+                # 可选：按 epoch 百分比记录，默认关闭。
+                if args.log_progress_percent > 0 and batches_this_epoch > 0:
+                    current_pct = batch_in_epoch / batches_this_epoch * 100
+                    while current_pct >= next_progress_pct and next_progress_pct <= 100:
+                        log(
+                            f"epoch {epoch} 进度 {next_progress_pct:.0f}% | "
+                            f"batch={batch_in_epoch}/{batches_this_epoch} "
+                            f"epoch_step={epoch_step}/{steps_this_epoch} "
+                            f"global_step={step}/{target_steps} "
+                            f"loss={loss.item():.4f} lr={scheduler.get_last_lr()[0]:.2e} "
+                            f"elapsed={time.perf_counter() - run_started:.0f}s",
+                            args.variant,
+                        )
+                        next_progress_pct += args.log_progress_percent
+
+                # 默认每 100 个 optimizer step 写一条日志。
+                if args.log_interval > 0 and step % args.log_interval == 0:
                     log(
                         f"step {step}/{target_steps} loss={loss.item():.4f} "
                         f"lr={scheduler.get_last_lr()[0]:.2e} "
                         f"elapsed={time.perf_counter() - run_started:.0f}s",
                         args.variant,
                     )
-                if step >= target_steps:
-                    break
+
+            # 可选：按 batch 记录，默认关闭。
+            if args.log_batch_interval > 0 and batch_in_epoch % args.log_batch_interval == 0:
+                log(
+                    f"epoch {epoch} batch={batch_in_epoch}/{batches_this_epoch} | "
+                    f"global_step={step}/{target_steps} "
+                    f"loss={loss.item():.4f} lr={scheduler.get_last_lr()[0]:.2e} "
+                    f"elapsed={time.perf_counter() - run_started:.0f}s",
+                    args.variant,
+                )
+
+            if step >= target_steps:
+                break
 
         progress.close()
         log(
-            f"epoch {epoch} 训练结束 | epoch_steps={progress.n} "
+            f"epoch {epoch} 训练结束 | epoch_batches={batch_in_epoch}/{batches_this_epoch} "
+            f"epoch_steps={epoch_step}/{steps_this_epoch} "
             f"global_step={step}/{target_steps} "
             f"elapsed={time.perf_counter() - epoch_started:.0f}s",
             args.variant,
@@ -674,7 +716,18 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--accum-steps", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=4_000)
-    parser.add_argument("--log-interval", type=int, default=10)
+    parser.add_argument(
+        "--log-batch-interval", type=int, default=0,
+        help="每处理 N 个 batch 写一条日志；默认关闭",
+    )
+    parser.add_argument(
+        "--log-interval", type=int, default=100,
+        help="每 N 个 optimizer step 写一条日志；默认 100",
+    )
+    parser.add_argument(
+        "--log-progress-percent", type=float, default=0.0,
+        help="按 epoch 百分比写日志；默认关闭，避免日志过密",
+    )
     parser.add_argument("--num-workers", type=int, default=2)
 
     parser.add_argument("--beam-size", type=int, default=4)
@@ -703,13 +756,14 @@ def main():
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
-    args.results_dir.mkdir(parents=True, exist_ok=True)
+    variant_results_dir = args.results_dir / args.variant
+    variant_results_dir.mkdir(parents=True, exist_ok=True)
 
     train_data = load_split(args.data_dir, "train", args.max_train_samples)
     val_data = load_split(args.data_dir, "validation", args.max_val_samples)
     test_data = load_split(args.data_dir, "test", args.max_test_samples)
 
-    sp_path = args.results_dir / "spm" / f"de-en.bpe.{args.vocab_size}.model"
+    sp_path = variant_results_dir / "spm" / f"de-en.bpe.{args.vocab_size}.model"
     train_sentencepiece(
         train_data, sp_path, args.vocab_size,
         args.spm_train_samples, os.cpu_count() or 4,
@@ -746,7 +800,7 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=1.0, betas=(0.9, 0.98), eps=1e-9)
     scheduler = NoamScheduler(optimizer, cfg.d_model, args.warmup)
 
-    ckpt_dir = args.results_dir / "checkpoints"
+    ckpt_dir = variant_results_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     summary = train_and_evaluate(
         model, train_loader, val_loader, test_loader, criterion, optimizer,
@@ -784,9 +838,9 @@ def main():
         "paper_params_m": f"{cfg.paper_params:.1f}",
         "checkpoint": summary["checkpoint"],
     }
-    append_result(result, args.results_dir)
-    write_comparison(args.results_dir)
-    log(f"结果已保存到 {args.results_dir / 'variations_results.csv'}", args.variant)
+    append_result(result, variant_results_dir)
+    write_comparison(variant_results_dir)
+    log(f"结果已保存到 {variant_results_dir / 'variations_results.csv'}", args.variant)
 
 
 if __name__ == "__main__":

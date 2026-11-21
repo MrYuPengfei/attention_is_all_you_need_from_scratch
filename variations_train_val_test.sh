@@ -5,7 +5,6 @@ set -euo pipefail
 PYTHON_BIN="${PYTHON_BIN:-$HOME/pytorch-cuda13.4-venv/bin/python}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY_SCRIPT="$SCRIPT_DIR/variations_train_val_test.py"
-LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/results/variations/logs}"
 
 VARIANTS=(
   base A1 A2 A3 A4 B1 B2
@@ -30,10 +29,10 @@ usage() {
 
 说明:
   每次调用只运行一个变体。默认后台运行，日志保存到：
-    $LOG_DIR/<variant>_<时间>.log
+    results/<variant>/logs/<variant>_<时间>.log
+  每个变体的结果、checkpoint、词表和日志都放在 results/<variant>/ 下。
   可用 LOG_DIR 环境变量修改日志目录。
   --foreground 表示前台运行，同时用 tee 写入同一日志。
-  训练结果仍追加到 results/variations/，并与论文结果自动对比。
 EOF
 }
 
@@ -73,6 +72,7 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   exit 1
 fi
 
+LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/results/$VARIANT/logs}"
 mkdir -p "$LOG_DIR"
 STAMP="$(date +"%Y%m%d_%H%M%S")"
 LOG_FILE="$LOG_DIR/${VARIANT}_${STAMP}_$$.log"

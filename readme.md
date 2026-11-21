@@ -88,6 +88,92 @@ best_model.pt: 训练过程中得到的最好的模型
 test.py 实验模型训练效果（中译英）
 ## 实验结果
 ![alt text](image.png)
+
+## 对论文中Transformer变体的复现
+之前完整 WMT14 En-De 训练集的实际大小是：
+
+```text
+4,508,785 条句对
+```
+
+在默认 `batch_size=32` 下：
+
+```text
+一个 epoch 的 batch 数 = ceil(4,508,785 / 32) = 140,900
+```
+
+你之前看到的进度条：
+
+```text
+70/17613
+```
+
+这里的 `17613` 不是 batch 数，而是 **optimizer step 数**，因为默认：
+
+```text
+accum_steps = 8
+```
+
+```text
+140900 // 8 = 17612 optimizer steps
+```
+
+所以：
+
+| 项目 | 数量 |
+|---|---:|
+| 训练句对 | 4,508,785 |
+| batch_size | 32 |
+| 每个 epoch batch 数 | 140,900 |
+| accum_steps | 8 |
+| 每个 epoch optimizer steps | 17,612 |
+| 1 个 epoch 的 5% | 7,045 batches |
+| 换算成 optimizer steps | 约 881 steps |
+
+如果你想按 5% epoch 打一次日志，可以设置：
+
+```bash
+--log-batch-interval 7045
+```
+
+当前默认的 `--log-batch-interval 1000` 大约是每 `0.71%` epoch 打一次日志。
+
+-
+​
+ 单步batch容量：src≈25k token，tgt≈25k token
+​
+> We trained on the standard WMT 2014 English-German dataset consisting of about 4.5 million sentence pairs. Sentences were encoded using byte-pair encoding [3], which has a shared source-target vocabulary of about 37000 tokens. For English-French, we used the significantly larger WMT 2014 English-French dataset consisting of 36M sentences and split tokens into a 32000 word-piece vocabulary [38]. Sentence pairs were batched together by approximate sequence length. Each training batch contained a set of sentence pairs containing approximately 25000 source tokens and 25000 target tokens.
+中文： 我们在标准 WMT2014 英德数据集（约450万句对）上训练，句子用BPE编码，源端目标端共享约37000词表；英法任务用更大的WMT2014英法数据集（3600万句），词表32000。按相近序列长度打包句对。每个训练batch大约包含25000个source token + 25000个target token。
+​
+> ✅ 论文这里的 batch：token 容量，不是固定句子数量；一个 batch = 一次 optimizer step（无梯度累积）
+
+￼
+​
+​
+￼
+5.2 Hardware and Schedule（总 step 数原文）
+​
+> We trained our models on one machine with 8 NVIDIA P100 GPUs. For our base models using the hyperparameters described throughout the paper, each training step took about 0.4 seconds. We trained the base models for a total of 100,000 steps or 12 hours. For our big models, (described on the bottom line of table 3), step time was 1.0 seconds. The big models were trained for 300,000 steps (3.5 days).
+中文： 单台8卡P100训练。Base模型每step约0.4s，总共训练100,000 step（12小时）；Big模型每step约1s，总共训练300,000 step（3.5天）。
+​
+> ✅ 这里的 step = optimizer step（参数更新次数）
+
+￼
+​
+​
+￼
+## 5.3 Optimizer（warmup step 原文）
+​
+> We used the Adam optimizer [20] with 𝛽1=0.9, 𝛽2=0.98 and 𝜖=10−9. We varied the learning rate over the course of training, according to the formula: 
+𝑙𝑟𝑎𝑡𝑒=𝑑−0.5
+𝑚𝑜𝑑𝑒𝑙⋅min(𝑠𝑡𝑒𝑝𝑛𝑢𝑚−0.5,𝑠𝑡𝑒𝑝𝑛𝑢𝑚⋅𝑤𝑎𝑟𝑚𝑢𝑝𝑠𝑡𝑒𝑝𝑠−1.5)
+￼
+ This corresponds to increasing the learning rate linearly for the first 𝑤𝑎𝑟𝑚𝑢𝑝𝑠𝑡𝑒𝑝𝑠 training steps, and decreasing it thereafter proportionally to the inverse square root of the step number. **We used 𝑤𝑎𝑟𝑚𝑢𝑝𝑠𝑡𝑒𝑝𝑠=4000.**
+中文： Adam，𝛽1=0.9,𝛽2=0.98,𝜖=10−9；学习率按上面公式调度：前 `\(warmup\_steps\)` 线性升lr，之后按 step_num 的平方根倒数衰减。**(warmup_steps) = 4000**。
+
+
+
+
 ## 参考资料
 [论文原文](https://arxiv.org/abs/1706.03762)
 [论文精讲](https://www.youtube.com/watch?v=nzqlFIcCSWQ)
