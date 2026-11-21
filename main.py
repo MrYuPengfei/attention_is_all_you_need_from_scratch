@@ -9,7 +9,7 @@ from datetime import timedelta
 from tqdm import tqdm  # 进度条
 
 from model import Transformer
-from dataset import get_dataset, sos, eos, cmn_words, eng_words, seq_len, pad
+from data import get_dataset, sos, eos, cmn_words, eng_words, seq_len, pad
 
 # ---------------------
 # 设备选择

@@ -8,7 +8,7 @@ from time import perf_counter
 # - Prints a short summary and exits
 
 from model import Transformer
-from dataset import get_dataset, cmn_words, eng_words, seq_len, pad
+from data import get_dataset, cmn_words, eng_words, seq_len, pad
 
 def main():
     torch.manual_seed(9527)

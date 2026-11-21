@@ -1,7 +1,7 @@
 # inference.py
 import torch
 from model import Transformer
-from dataset import cmn_words, eng_words, sos, eos, seq_len, pad, get_dataset
+from data import cmn_words, eng_words, sos, eos, seq_len, pad, get_dataset
 
 # ---------------------
 # 加载模型
