@@ -149,5 +149,5 @@ print("Saved training loss plot to training_loss.png")
 # ---------------------
 # 加载最佳模型进行测试
 # ---------------------
-model.load_state_dict(torch.load("best_model.pt", map_location=device))
+model.load_state_dict(torch.load("best_model-zh-en.pt", map_location=device))
 eval(model, test_loader, print_result, seq_len)
