@@ -4,6 +4,11 @@
     python variations_train_val_test.py --variant base
     python variations_train_val_test.py --variant A1 --epochs 3
 
+从已有 checkpoint 继续训练（epochs 表示最终 epoch 编号）：
+    python variations_train_val_test.py --variant base \
+        --epoch-begin 4 --epochs 6 \
+        --model-load results/base/checkpoints/base_best.pt
+
 每个 epoch 开始时会打印训练/验证/测试集的首个句子；
 训练过程中默认每 100 个 optimizer step 写一条日志；
 每个 epoch 结束时计算 PPL/BLEU，并在 PPL 变好时立即保存最优模型。
@@ -456,16 +461,19 @@ def evaluate_bleu(model, loader, sp, args, device):
 
 def train_and_evaluate(
     model, train_loader, val_loader, test_loader, criterion, optimizer,
-    scheduler, sp, args, device, target_steps, ckpt_dir,
+    scheduler, sp, args, device, target_steps, ckpt_dir, resume_state=None,
 ):
     """按 epoch 训练，并在每个 epoch 结束时评估、保存最优模型。"""
-    step = 0
-    best_ppl, best_bleu = float("inf"), 0.0
-    best_epoch = best_step = 0
+    resume_state = resume_state or {}
+    step = resume_state.get("global_step", 0)
+    best_ppl = resume_state.get("best_ppl", float("inf"))
+    best_bleu = resume_state.get("best_bleu", 0.0)
+    best_epoch = resume_state.get("best_epoch", 0)
+    best_step = resume_state.get("best_step", 0)
     best_ckpt = ckpt_dir / f"{args.variant}_best.pt"
     run_started = time.perf_counter()
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(args.epoch_begin, args.epochs + 1):
         if step >= target_steps:
             log(f"已达到目标步数 {target_steps}，提前结束训练", args.variant)
             break
@@ -588,11 +596,19 @@ def train_and_evaluate(
                 {
                     "config": asdict(model.cfg),
                     "state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
                     "spm_path": str(ckpt_dir.parent / "spm" / f"de-en.bpe.{args.vocab_size}.model"),
+                    "vocab_size": sp.get_piece_size(),
+                    "max_len": args.max_len,
                     "epoch": epoch,
-                    "step": step,
+                    "global_step": step,
                     "ppl": ppl,
                     "bleu": bleu,
+                    "best_epoch": best_epoch,
+                    "best_step": best_step,
+                    "best_ppl": best_ppl,
+                    "best_bleu": best_bleu,
                 },
                 best_ckpt,
             )
@@ -613,7 +629,7 @@ def train_and_evaluate(
         "best_bleu": best_bleu,
         "best_epoch": best_epoch,
         "best_step": best_step,
-        "checkpoint": str(best_ckpt) if best_epoch else "",
+        "checkpoint": str(best_ckpt) if best_epoch else str(args.model_load or ""),
     }
 
 
@@ -623,7 +639,7 @@ def train_and_evaluate(
 RESULT_FIELDS = [
     "run_id", "variant", "paper_label", "timestamp",
     "N", "d_model", "d_ff", "h", "d_k", "d_v", "p_drop", "eps_ls", "pos_emb",
-    "epochs", "actual_train_steps", "best_epoch", "best_step",
+    "epoch_begin", "epochs", "actual_train_steps", "best_epoch", "best_step",
     "batch_size", "accum_steps", "vocab_size", "max_len",
     "params_m", "ppl_dev", "bleu_dev", "paper_ppl", "paper_bleu",
     "ppl_delta", "bleu_delta", "paper_params_m", "checkpoint",
@@ -712,7 +728,9 @@ def parse_args():
     parser.add_argument("--max-len", type=int, default=100)
 
     parser.add_argument("--train-steps", type=int, default=0, help="总训练步数上限；0 表示使用变体论文默认步数")
-    parser.add_argument("--epochs", type=int, default=1, help="训练轮数；达到 train-steps 后会提前结束")
+    parser.add_argument("--epoch-begin", type=int, default=1, help="起始 epoch 编号，续训时从 checkpoint 的下一个 epoch 开始")
+    parser.add_argument("--epochs", type=int, default=1, help="最终 epoch 编号；从 epoch-begin 训练到此编号")
+    parser.add_argument("--model-load", type=Path, default=None, help="从该 checkpoint 加载模型/优化器/调度器状态继续训练")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--accum-steps", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=4_000)
@@ -747,8 +765,55 @@ def load_split(data_dir, split, max_samples):
     return dataset
 
 
+def restore_checkpoint(path, model, optimizer, scheduler, cfg, vocab_size, max_len, variant):
+    """从 checkpoint 恢复模型、优化器、调度器状态及最优指标。"""
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+
+    # train_steps 可以在续训时延长，不作为模型结构一致性检查项。
+    if checkpoint.get("config"):
+        saved_cfg = {k: v for k, v in checkpoint["config"].items() if k != "train_steps"}
+        current_cfg = {k: v for k, v in asdict(cfg).items() if k != "train_steps"}
+        if saved_cfg != current_cfg:
+            raise ValueError(f"checkpoint 模型配置与当前变体不一致: {path}")
+    if checkpoint.get("vocab_size", vocab_size) != vocab_size:
+        raise ValueError(f"checkpoint 词表大小与当前配置不一致: {path}")
+    if checkpoint.get("max_len", max_len) != max_len:
+        raise ValueError(f"checkpoint max_len 与当前配置不一致: {path}")
+
+    model.load_state_dict(checkpoint["state_dict"], strict=True)
+    if "optimizer_state_dict" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    if "scheduler_state_dict" in checkpoint:
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+
+    resume_state = {
+        "global_step": checkpoint.get("global_step", checkpoint.get("step", 0)),
+        "best_ppl": checkpoint.get("best_ppl", checkpoint.get("ppl", float("inf"))),
+        "best_bleu": checkpoint.get("best_bleu", checkpoint.get("bleu", 0.0)),
+        "best_epoch": checkpoint.get("best_epoch", checkpoint.get("epoch", 0)),
+        "best_step": checkpoint.get("best_step", checkpoint.get("step", 0)),
+    }
+    log(
+        f"已从 checkpoint 恢复 | path={path} global_step={resume_state['global_step']} "
+        f"best_epoch={resume_state['best_epoch']} best_ppl={resume_state['best_ppl']:.2f} "
+        f"best_bleu={resume_state['best_bleu']:.1f}",
+        variant,
+    )
+    return resume_state
+
+
 def main():
     args = parse_args()
+
+    if args.epoch_begin < 1:
+        raise ValueError("--epoch-begin 必须大于等于 1")
+    if args.epochs < args.epoch_begin:
+        raise ValueError("--epochs 必须大于等于 --epoch-begin")
+    if args.epoch_begin > 1 and args.model_load is None:
+        raise ValueError("指定 --epoch-begin > 1 时必须通过 --model-load 提供 checkpoint")
+    if args.model_load is not None and not args.model_load.exists():
+        raise FileNotFoundError(f"找不到 checkpoint: {args.model_load}")
+
     cfg = VARIANTS[args.variant]
     if args.train_steps:
         cfg = VariantConfig(**{**asdict(cfg), "train_steps": args.train_steps})
@@ -791,7 +856,7 @@ def main():
     model = Transformer(sp.get_piece_size(), cfg, args.max_len).to(device)
     params_m = sum(p.numel() for p in model.parameters()) / 1e6
     log(
-        f"params={params_m:.1f}M epochs={args.epochs} "
+        f"params={params_m:.1f}M epochs={args.epoch_begin}..{args.epochs} "
         f"target_steps={cfg.train_steps} device={device}",
         args.variant,
     )
@@ -800,11 +865,18 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=1.0, betas=(0.9, 0.98), eps=1e-9)
     scheduler = NoamScheduler(optimizer, cfg.d_model, args.warmup)
 
+    resume_state = None
+    if args.model_load is not None:
+        resume_state = restore_checkpoint(
+            args.model_load, model, optimizer, scheduler,
+            cfg, sp.get_piece_size(), args.max_len, args.variant,
+        )
+
     ckpt_dir = variant_results_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     summary = train_and_evaluate(
         model, train_loader, val_loader, test_loader, criterion, optimizer,
-        scheduler, sp, args, device, cfg.train_steps, ckpt_dir,
+        scheduler, sp, args, device, cfg.train_steps, ckpt_dir, resume_state,
     )
 
     ppl, bleu = summary["best_ppl"], summary["best_bleu"]
@@ -824,6 +896,7 @@ def main():
         "N": cfg.N, "d_model": cfg.d_model, "d_ff": cfg.d_ff,
         "h": cfg.h, "d_k": cfg.d_k, "d_v": cfg.d_v,
         "p_drop": cfg.p_drop, "eps_ls": cfg.eps_ls, "pos_emb": cfg.pos_emb,
+        "epoch_begin": args.epoch_begin,
         "epochs": args.epochs,
         "actual_train_steps": summary["actual_train_steps"],
         "best_epoch": summary["best_epoch"],

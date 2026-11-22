@@ -26,6 +26,7 @@ usage() {
   $0 base
   $0 C1 --train-steps 200 --max-train-samples 5000
   $0 A3 --batch-size 16 --accum-steps 16
+  $0 base --epoch-begin 4 --epochs 6 --model-load results/base/checkpoints/base_best.pt
 
 说明:
   每次调用只运行一个变体。默认后台运行，日志保存到：
